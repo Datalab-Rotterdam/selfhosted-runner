@@ -17,7 +17,8 @@ You need Docker (with Compose) on the machine that will run the jobs.
 **1. Create a PAT**
 
 - Repo runners: fine-grained PAT with **Administration: read & write** on the repo(s) (add **Actions: read** for autoscale), or a classic PAT with `repo`.
-- Org runners: classic PAT with `admin:org`.
+- Org runners: fine-grained PAT with org **Self-hosted runners: read & write**, or a classic PAT with `admin:org`.
+- Step-by-step token setup per example: [examples/README.md](examples/README.md#creating-the-pat).
 
 **2. Make a folder with three files** (or copy one from [examples/](examples), e.g. [examples/single-repo](examples/single-repo))
 
@@ -139,8 +140,19 @@ make up        # build + start      make logs      make down   # remove runners 
 ```
 
 Build args: `RUNNER_VERSION` (default 2.338.0), `RUNNER_SHA256_X64`, `RUNNER_SHA256_ARM64` (arm64 checksum
-not verified if unset). Images are published by [publish.yml](.github/workflows/publish.yml) on push to
-`main` and `v*` tags.
+not verified if unset). Images are published by [publish.yml](.github/workflows/publish.yml) on every push to `main`.
+
+## Releases and versioning
+
+Versions are automated with [semantic-release](https://semantic-release.gitbook.io) from
+[Conventional Commits](https://www.conventionalcommits.org) on `main`: `fix:` → patch, `feat:` → minor,
+`feat!:` / a `BREAKING CHANGE:` footer → major. `docs:`, `ci:`, `chore:` etc. don't release. A release creates
+a `vX.Y.Z` tag and GitHub release, and both images get the tags `X.Y.Z`, `X.Y`, `X`, `latest` and `sha-…`:
+
+```sh
+docker pull ghcr.io/datalab-rotterdam/selfhosted-runner:1        # follow a major
+docker pull ghcr.io/datalab-rotterdam/selfhosted-runner:1.2.3    # pin exactly
+```
 
 ## Security
 
