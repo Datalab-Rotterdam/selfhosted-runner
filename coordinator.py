@@ -29,7 +29,9 @@ SCALE_INTERVAL = int(os.environ.get("SCALE_INTERVAL", "15"))  # GitHub API polli
 STOP_TIMEOUT = os.environ.get("STOP_TIMEOUT", "60")  # time for runner to deregister
 REGISTER_TIMEOUT = int(os.environ.get("REGISTER_TIMEOUT", "120"))  # warn if not online by then
 MAX_FAILURES = int(os.environ.get("MAX_FAILURES", "3"))  # startup failures before blocking
+COORD_ID = os.environ.get("COORDINATOR_ID", "default")  # set a unique id per coordinator sharing one docker host
 LABEL = "selfhosted-runner.managed"
+COORD_LABEL = "selfhosted-runner.coordinator"
 HASH_LABEL = "selfhosted-runner.hash"
 POOL_LABEL = "selfhosted-runner.pool"
 
@@ -169,7 +171,8 @@ def parse(cfg):
 def existing():
     """name -> {hash, pool, state, status}"""
     fmt = '{{.Names}}\t{{.State}}\t{{.Status}}\t{{.Label "%s"}}\t{{.Label "%s"}}' % (HASH_LABEL, POOL_LABEL)
-    res = docker("ps", "-a", "--filter", f"label={LABEL}=true", "--format", fmt)
+    res = docker("ps", "-a", "--filter", f"label={LABEL}=true",
+                 "--filter", f"label={COORD_LABEL}={COORD_ID}", "--format", fmt)
     out = {}
     for line in res.stdout.splitlines():
         name, state, status, h, pool = line.split("\t")
@@ -197,7 +200,7 @@ def start(name, spec, pool=""):
     # no docker restart policy: the coordinator restarts runners so it can tell crashes from startup failures
     args = ["run", "-d", "--name", name,
             "--label", f"{LABEL}=true", "--label", f"{HASH_LABEL}={spec_hash(spec)}",
-            "--label", f"{POOL_LABEL}={pool}"]
+            "--label", f"{POOL_LABEL}={pool}", "--label", f"{COORD_LABEL}={COORD_ID}"]
     for k in env:
         args += ["-e", k]  # value passed via subprocess env, not argv
     if spec["docker_socket"]:

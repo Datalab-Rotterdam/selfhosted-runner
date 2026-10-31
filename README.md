@@ -99,7 +99,7 @@ If the GHCR packages are private, `docker login ghcr.io` first or make them publ
 | `api_url` | repo/defaults | GitHub Enterprise API base URL |
 
 Coordinator env vars: `POLL_INTERVAL` (default 5s), `SCALE_INTERVAL` (GitHub API poll for autoscale, default 15s),
-`STOP_TIMEOUT` (time for a runner to deregister on stop, default 60s), `REGISTER_TIMEOUT` (warn if a runner isn't online by then, default 120s), `MAX_FAILURES` (startup failures before a repo is blocked, default 3).
+`COORDINATOR_ID` (default `default`; set a unique value per coordinator if several share one Docker host, otherwise they remove each other's runners and runner names must also differ via `name_prefix`), `STOP_TIMEOUT` (time for a runner to deregister on stop, default 60s), `REGISTER_TIMEOUT` (warn if a runner isn't online by then, default 120s), `MAX_FAILURES` (startup failures before a repo is blocked, default 3).
 
 ## Health checks and logs
 
