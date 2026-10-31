@@ -193,7 +193,7 @@ def remove(name):
     forget(name)
 
 
-def start(name, spec, pool=""):
+def start(name, spec, group, pool=""):
     log(f"starting {name}")
     forget(name)
     env = {**spec["env"], "RUNNER_NAME": name}
@@ -207,7 +207,12 @@ def start(name, spec, pool=""):
         args += ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
     res = docker(*args, spec["image"], env=env, check=False)
     if res.returncode:
-        log(f"failed to start {name}: {res.stderr.strip()}")
+        reason = res.stderr.strip().replace("\n", " | ")
+        group.fails += 1
+        log(f"failed to start {name} [{group.fails}/{MAX_FAILURES}]: {reason}")
+        group.next_spawn = next_try[name] = time.time() + 10 * 2 ** group.fails
+        if group.fails >= MAX_FAILURES:
+            group.block(f"could not start {MAX_FAILURES} runners in a row, last error: {reason}")
         return False
     started_at[name] = time.time()
     return True
@@ -275,7 +280,8 @@ def scale_pool(slug, pool, alive):
     if len(alive) < target and time.time() >= group.next_spawn:
         log(f"{slug}: queued={queued} busy={len(busy)} alive={len(alive)} -> +{target - len(alive)}")
         for _ in range(target - len(alive)):
-            start(f"{pool['prefix']}-{uuid.uuid4().hex[:6]}", pool["base"], pool=slug)
+            if not start(f"{pool['prefix']}-{uuid.uuid4().hex[:6]}", pool["base"], group, pool=slug):
+                break
     elif len(alive) > target:
         for name in [n for n in alive if n not in busy][: len(alive) - target]:
             remove(name)
@@ -307,7 +313,7 @@ def reconcile(fixed, pools):
     have = existing()
     for name, (spec, group) in fixed.items():
         if name not in have and group.ready and time.time() >= next_try.get(name, 0):
-            start(name, spec)
+            start(name, spec, group)
     for slug, pool in pools.items():
         if pool["group"].ready and refreshed[id(pool["group"])]:
             scale_pool(slug, pool, alive[slug])
