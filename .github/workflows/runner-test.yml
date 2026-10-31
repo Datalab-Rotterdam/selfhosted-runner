@@ -1,0 +1,12 @@
+name: runner-test
+
+on: workflow_dispatch
+
+jobs:
+  hello:
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        n: [1, 2, 3]
+    steps:
+      - run: echo "job ${{ matrix.n }} on $(hostname)" && sleep 45
