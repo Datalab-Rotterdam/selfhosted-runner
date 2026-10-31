@@ -1,0 +1,16 @@
+services:
+  # build-only: produces the runner image the coordinator launches
+  runner-image:
+    build: .
+    image: selfhosted-runner:local
+    profiles: [build]
+
+  coordinator:
+    build:
+      dockerfile: Dockerfile.coordinator
+      context: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/config:ro   # mount the folder, not the file: editors that save via rename would otherwise go unseen

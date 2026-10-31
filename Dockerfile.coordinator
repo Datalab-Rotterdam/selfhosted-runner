@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends docker.io \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir pyyaml
+
+COPY coordinator.py /app/coordinator.py
+WORKDIR /app
+ENTRYPOINT ["python3", "-u", "coordinator.py"]

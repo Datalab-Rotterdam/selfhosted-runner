@@ -1,0 +1,35 @@
+# cp runners.example.yaml runners.yaml
+# image: ghcr.io/datalab-rotterdam/selfhosted-runner:latest   # default: selfhosted-runner:local (make build)
+name_prefix: runner
+
+defaults:
+  labels: [docker]
+  ephemeral: false      # true = fresh runner per job
+  docker_socket: false  # true = mount host docker.sock (workflows can use docker; security tradeoff)
+
+repos:
+  - url: https://github.com/Datalab-Rotterdam/foo
+    pat_env: GH_PAT_FOO   # env var (in .env) holding a PAT
+    replicas: 3
+    labels: [docker, gpu]
+
+  - url: https://github.com/Datalab-Rotterdam/bar
+    pat_env: GH_PAT_BAR
+    replicas: 1
+
+  # on-demand: ephemeral runners spawned while jobs are queued (repo URLs only)
+  # - url: https://github.com/Datalab-Rotterdam/baz
+  #   pat_env: GH_PAT_BAZ
+  #   autoscale: {min: 0, max: 5}
+
+  # org-level runners (shared by all repos in the org):
+  # - url: https://github.com/Datalab-Rotterdam
+  #   pat_env: GH_PAT_ORG
+  #   replicas: 2
+  #   group: default
+  #
+  # org-level + autoscale: list the repos to watch for queued jobs
+  # - url: https://github.com/Datalab-Rotterdam
+  #   pat_env: GH_PAT_ORG
+  #   autoscale: {min: 0, max: 5}
+  #   watch_repos: [foo, bar]
