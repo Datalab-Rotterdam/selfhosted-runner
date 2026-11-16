@@ -109,6 +109,7 @@ Edit `runners.yaml` while it runs; the coordinator applies changes within second
 To stop and deregister everything:
 
 ```sh
+docker compose stop coordinator
 docker compose run --rm coordinator --down
 docker compose down
 ```

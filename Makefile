@@ -8,6 +8,7 @@ up: build
 
 # stop coordinator AND deregister/remove all runners
 down:
+	docker compose stop coordinator
 	docker compose run --rm coordinator --down
 	docker compose down
 

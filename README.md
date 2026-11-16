@@ -66,9 +66,10 @@ within seconds; changed runners are recreated, removed ones deregister.
 
 **Stop everything:**
 ```sh
-docker compose run --rm coordinator --down && docker compose down
+docker compose stop coordinator && docker compose run --rm coordinator --down && docker compose down
 ```
-(`docker compose stop` alone stops only the coordinator; runners keep running.)
+(`docker compose stop` alone stops only the coordinator; runners keep running. Stop it before `--down`,
+or it restarts the runners that `--down` removes.)
 
 If the GHCR packages are private, `docker login ghcr.io` first or make them public.
 
@@ -95,7 +96,12 @@ If the GHCR packages are private, `docker login ghcr.io` first or make them publ
 | `labels` | repo/defaults | extra runner labels |
 | `group` | repo/defaults | runner group (org runners) |
 | `ephemeral` | repo/defaults | one job per runner, then a fresh one |
-| `docker_socket` | repo/defaults | mount the host docker socket into runners so workflows can use `docker` |
+| `docker` | repo/defaults | `dind`: each runner gets its own Docker daemon (see [Docker in jobs](#docker-in-jobs)); `socket`: mount the host socket (unsafe) |
+| `dind_image` | repo/defaults | daemon image for `docker: dind` (default `docker:29-dind`) |
+| `dind_runtime` | repo/defaults | container runtime for the daemon, e.g. `sysbox-runc`; without it the daemon runs `--privileged` |
+| `dind_dns` | repo/defaults | DNS servers for containers inside the daemon (default: the servers the host gives containers) |
+| `cpus`, `memory` | repo/defaults | `docker run --cpus/--memory` for the runner and, with `dind`, its daemon |
+| `docker_socket` | repo/defaults | old spelling of `docker: socket` |
 | `api_url` | repo/defaults | GitHub Enterprise API base URL |
 
 Coordinator env vars: `POLL_INTERVAL` (default 5s), `SCALE_INTERVAL` (GitHub API poll for autoscale, default 15s),
@@ -130,6 +136,37 @@ container is then removed; idle surplus runners are removed. Job labels aren't m
 GitHub has no org-wide queue API, so org autoscale polls only the repos in `watch_repos`. API calls grow
 with that list; raise `SCALE_INTERVAL` if you watch many.
 
+## Docker in jobs
+
+The runner image ships the Docker CLI (with buildx and compose) but no daemon. With `docker: dind`
+the coordinator starts, next to each runner:
+
+- a `docker:dind` daemon (`<runner>-dind`) on a network of its own (`<runner>-net`), reachable from the
+  runner only, over TLS with client certs from a per-runner volume (`DOCKER_HOST=tcp://docker:2376`);
+- a workspace volume mounted at the same path in runner and daemon, so
+  `docker run -v "$GITHUB_WORKSPACE:/src" ...` works as on GitHub-hosted runners.
+
+Daemon, network and volumes are removed with the runner. Combine it with `ephemeral: true` (or
+`autoscale`) so every job starts with an empty daemon: no images, containers or files left by earlier jobs.
+
+```yaml
+defaults:
+  ephemeral: true
+  docker: dind
+  cpus: 4
+  memory: 16g
+```
+
+What this isolates, and what it does not:
+
+- Jobs cannot reach the host daemon, so they cannot see or control other runners or the coordinator
+  (whose environment holds every PAT). With `docker: socket` they can, and that is root on the host.
+- Without `dind_runtime` the daemon runs `--privileged`, so jobs can run privileged containers
+  (needed for cgroup, mount and loop-device tests). A job that sets out to can escape a privileged
+  container onto the Docker host. Treat the host as belonging to the repos it serves, and only attach
+  private repos you trust. For a hard boundary install [Sysbox](https://github.com/nestybox/sysbox) and
+  set `dind_runtime: sysbox-runc`, or run the coordinator inside a dedicated VM.
+
 ## Building locally
 
 ```sh
@@ -158,5 +195,12 @@ docker pull ghcr.io/datalab-rotterdam/selfhosted-runner:1.2.3    # pin exactly
 
 - Don't attach self-hosted runners to public repos: fork PRs can run arbitrary code on your host.
 - The coordinator mounts the host `docker.sock`, which is root-equivalent access to the host. Keep it private.
-- `docker_socket: true` gives workflows the same access.
+- `docker: socket` gives workflows the same access. Prefer `docker: dind` (see [Docker in jobs](#docker-in-jobs)).
+- Runners never get a PAT: the coordinator mints a one-hour registration token per runner, copies it
+  in as a file the entrypoint deletes after registering (never an env var, which stays readable in
+  `/proc/1/environ` and `docker inspect`), and deregisters runners through the API. Jobs inherit the runner's environment and have `sudo`, so anything
+  in the container is readable by jobs. (Running `entrypoint.sh` standalone with `GITHUB_PAT` still works,
+  but then the PAT is in the container.)
+- A runner removed because its repo entry was deleted from `runners.yaml` cannot be deregistered (its
+  PAT may be gone); GitHub prunes offline self-hosted runners after 14 days.
 - PATs live in `.env`; keep it out of git (it's in `.gitignore` here, add it to your own folder too).

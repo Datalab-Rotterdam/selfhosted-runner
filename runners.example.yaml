@@ -5,7 +5,8 @@ name_prefix: runner
 defaults:
   labels: [docker]
   ephemeral: false      # true = fresh runner per job
-  docker_socket: false  # true = mount host docker.sock (workflows can use docker; security tradeoff)
+  # docker: dind        # per-runner Docker daemon over TLS (pair with ephemeral: true); see README
+  # docker: socket      # host docker.sock: workflows get root on the host, avoid
 
 repos:
   - url: https://github.com/Datalab-Rotterdam/foo
