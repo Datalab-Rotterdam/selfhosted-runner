@@ -10,7 +10,20 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl git jq sudo tini unzip \
+        ca-certificates curl git gnupg jq sudo tini unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Docker client only (no daemon): with `docker: dind` jobs reach a per-runner daemon over TLS.
+# Docker's apt key is pinned by fingerprint.
+ARG DOCKER_GPG_FPR=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
+    && gpg_fpr=$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc 2>/dev/null | awk -F: '/^fpr/{print $10; exit}') \
+    && if [ "$gpg_fpr" != "$DOCKER_GPG_FPR" ]; then echo "docker apt key fingerprint mismatch: $gpg_fpr" >&2; exit 1; fi \
+    && . /etc/os-release \
+    && echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash runner \
@@ -18,6 +31,7 @@ RUN useradd -m -s /bin/bash runner \
 
 USER runner
 WORKDIR /home/runner/actions-runner
+RUN mkdir -p _work
 
 RUN case "${TARGETARCH:-amd64}" in \
         amd64) ARCH=x64;   SHA="${RUNNER_SHA256_X64}" ;; \

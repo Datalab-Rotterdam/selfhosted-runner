@@ -2,7 +2,14 @@
 set -euo pipefail
 
 : "${REPO_URL:?REPO_URL required}"
-: "${GITHUB_PAT:?GITHUB_PAT required}"
+# The coordinator copies a short-lived registration token into TOKEN_FILE, so neither the PAT nor
+# the token is in this container's environment (jobs could read that via sudo and /proc/1/environ).
+# GITHUB_PAT: standalone use; the runner then also deregisters itself on stop.
+TOKEN_FILE=/home/runner/.registration-token
+if [[ ! -s "$TOKEN_FILE" && -z "${GITHUB_PAT:-}" ]]; then
+  echo "ERROR: GITHUB_PAT or a registration token in $TOKEN_FILE required" >&2
+  exit 1
+fi
 
 GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
 RUNNER_NAME="${RUNNER_NAME:-$(hostname)}"
@@ -39,7 +46,20 @@ token() { # $1 = registration-token | remove-token
 # drop stale registration from a previous run of this container
 rm -f .runner .credentials .credentials_rsaparams
 
-reg_token="$(token registration-token)"
+if [[ -s "$TOKEN_FILE" ]]; then
+  reg_token="$(<"$TOKEN_FILE")"
+  rm -f "$TOKEN_FILE"
+else
+  reg_token="$(token registration-token)"
+fi
+
+# docker: dind gives the runner a workspace volume shared with its daemon (so `docker run -v
+# $GITHUB_WORKSPACE:...` resolves) and client certs that appear once the daemon has started.
+sudo chown runner:runner _work
+if [[ -n "${DOCKER_CERT_PATH:-}" ]]; then
+  for _ in $(seq 60); do [[ -s "${DOCKER_CERT_PATH}/ca.pem" ]] && break; sleep 1; done
+  [[ -s "${DOCKER_CERT_PATH}/ca.pem" ]] || echo "WARN: no docker client certs in ${DOCKER_CERT_PATH}" >&2
+fi
 
 args=(--url "$REPO_URL" --token "$reg_token" --name "$RUNNER_NAME"
       --unattended --replace)
@@ -49,11 +69,18 @@ args=(--url "$REPO_URL" --token "$reg_token" --name "$RUNNER_NAME"
 
 ./config.sh "${args[@]}"
 
+# Secrets must not reach jobs: steps inherit this process's environment.
+pat="${GITHUB_PAT:-}"
+unset GITHUB_PAT reg_token
+
 cleanup() {
   echo "Deregistering runner ${RUNNER_NAME}"
   kill -TERM "$child" 2>/dev/null || true
   wait "$child" 2>/dev/null || true
-  ./config.sh remove --token "$(token remove-token)" || true
+  # without a PAT the coordinator deregisters the runner through the API instead
+  if [[ -n "$pat" ]]; then
+    GITHUB_PAT="$pat" ./config.sh remove --token "$(GITHUB_PAT="$pat" token remove-token)" || true
+  fi
 }
 trap cleanup TERM INT
 

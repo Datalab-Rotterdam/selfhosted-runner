@@ -9,12 +9,14 @@ permission as registering them). Permanent errors (bad PAT, no access) and repea
 failures block the repo instead of retrying forever.
 """
 import hashlib
+import io
 import json
 import os
 import re
 import signal
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.request
@@ -34,6 +36,11 @@ LABEL = "selfhosted-runner.managed"
 COORD_LABEL = "selfhosted-runner.coordinator"
 HASH_LABEL = "selfhosted-runner.hash"
 POOL_LABEL = "selfhosted-runner.pool"
+SIDECAR_LABEL = "selfhosted-runner.sidecar"  # value: the runner the dind daemon belongs to
+DIND_IMAGE = "docker:29-dind"
+WORK_DIR = "/home/runner/actions-runner/_work"
+TOKEN_FILE = ".registration-token"  # in /home/runner; entrypoint.sh deletes it after registering
+RUNNER_UID = 1001
 
 HINTS = {
     401: "PAT rejected (invalid or expired)",
@@ -64,12 +71,13 @@ class Group:
             log(f"{self.url}: BLOCKED, not retrying: {reason}. "
                 "Fix it, then edit runners.yaml (URL/settings) or recreate the coordinator (new PAT).")
 
-    def call(self, route):
-        req = urllib.request.Request(f"{self.api}/{route}", headers={
+    def call(self, route, method="GET"):
+        req = urllib.request.Request(f"{self.api}/{route}", method=method, headers={
             "Authorization": f"Bearer {self.pat}", "Accept": "application/vnd.github+json"})
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
-                return json.load(r)
+                body = r.read()
+                return json.loads(body) if body else None
         except urllib.error.HTTPError as e:
             limited = e.headers.get("X-RateLimit-Remaining") == "0"
             if e.code in HINTS and not limited:
@@ -100,6 +108,21 @@ class Group:
         self.checked = True
         return True
 
+    def registration_token(self):
+        """Short-lived (1h) token that can only register runners: runners never see the PAT."""
+        return self.call(f"{self.scope}/actions/runners/registration-token", method="POST")["token"]
+
+    def deregister(self, name):
+        """Remove a runner's registration (the container holds no PAT to do it itself)."""
+        try:
+            runners = self.call(f"{self.scope}/actions/runners?per_page=100")["runners"]
+            for r in runners:
+                if r["name"] == name:
+                    self.call(f"{self.scope}/actions/runners/{r['id']}", method="DELETE")
+                    log(f"{name}: deregistered")
+        except Exception as e:  # ephemeral runners deregister themselves; GitHub prunes the rest
+            log(f"{name}: could not deregister: {e}")
+
     @property
     def ready(self):
         return self.checked and not self.blocked
@@ -109,11 +132,24 @@ def log(msg):
     print(time.strftime("%H:%M:%S"), msg, flush=True)
 
 
-def docker(*args, env=None, check=True):
+def docker(*args, env=None, check=True, data=None):
     return subprocess.run(
-        ["docker", *args], check=check, capture_output=True, text=True,
+        ["docker", *args], check=check, capture_output=True, input=data, text=data is None,
         env={**os.environ, **(env or {})},
     )
+
+
+def token_tar(token):
+    """Tar stream for `docker cp -`: the token as a file only the runner user can read.
+
+    Not an env var: a container's initial environment stays readable (/proc/1/environ, docker inspect)
+    and jobs have sudo, so they could register rogue runners with it."""
+    buf, data = io.BytesIO(), token.encode()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(TOKEN_FILE)
+        info.size, info.mode, info.uid, info.gid = len(data), 0o400, RUNNER_UID, RUNNER_UID
+        tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
 
 
 def spec_hash(spec):
@@ -143,7 +179,6 @@ def parse(cfg):
         group = Group(url, f"orgs/{path}" if is_org else f"repos/{path}", pat, api)
         env = {
             "REPO_URL": url,
-            "GITHUB_PAT": pat,
             "RUNNER_LABELS": ",".join(opts.get("labels", [])),
             "RUNNER_EPHEMERAL": "true" if auto else str(bool(opts.get("ephemeral", False))).lower(),
         }
@@ -151,7 +186,14 @@ def parse(cfg):
             env["RUNNER_GROUP"] = opts["group"]
         if opts.get("api_url"):
             env["GITHUB_API_URL"] = opts["api_url"]
-        base = {"image": image, "env": env, "docker_socket": bool(opts.get("docker_socket"))}
+        mode = opts.get("docker") or ("socket" if opts.get("docker_socket") else None)
+        if mode not in (None, "socket", "dind"):
+            raise ValueError(f"docker must be `dind` or `socket`: {url}")
+        base = {"image": image, "env": env, "docker": mode,
+                "dind_image": opts.get("dind_image", DIND_IMAGE),
+                "dind_runtime": opts.get("dind_runtime"),
+                "dind_dns": opts.get("dind_dns"),
+                "cpus": opts.get("cpus"), "memory": opts.get("memory")}
 
         if auto:
             if is_org and not opts.get("watch_repos"):
@@ -180,34 +222,122 @@ def existing():
     return out
 
 
+def sidecars():
+    """runner name -> dind container name, for this coordinator"""
+    res = docker("ps", "-a", "--filter", f"label={SIDECAR_LABEL}", "--filter", f"label={COORD_LABEL}={COORD_ID}",
+                 "--format", '{{.Names}}\t{{.Label "%s"}}' % SIDECAR_LABEL)
+    return {owner: name for name, owner in (l.split("\t") for l in res.stdout.splitlines())}
+
+
+def drop_sidecar(name):
+    """Remove a runner's dind daemon, network and volumes (fresh daemon per runner)."""
+    docker("rm", "-f", "-v", f"{name}-dind", check=False)
+    docker("network", "rm", f"{name}-net", check=False)
+    docker("volume", "rm", "-f", f"{name}-certs", f"{name}-work", check=False)
+
+
+def limits(spec):
+    args = []
+    if spec.get("cpus"):
+        args += ["--cpus", str(spec["cpus"])]
+    if spec.get("memory"):
+        args += ["--memory", str(spec["memory"])]
+    return args
+
+
+_host_dns = None
+
+
+def host_dns(image):
+    """Upstream DNS servers as the host daemon hands them to containers on the default bridge.
+
+    A daemon on a user network only sees Docker's embedded DNS (127.0.0.11), which its own containers
+    cannot reach, so it would fall back to 8.8.8.8/8.8.4.4: blocked on many networks."""
+    global _host_dns
+    if _host_dns is None:
+        res = docker("run", "--rm", "--network", "bridge", "--entrypoint", "cat", image, "/etc/resolv.conf",
+                     check=False)
+        _host_dns = [l.split()[1] for l in res.stdout.splitlines()
+                     if l.startswith("nameserver") and not l.split()[1].startswith("127.")]
+        log(f"dind upstream DNS: {', '.join(_host_dns) or 'none found, daemon default'}")
+    return _host_dns
+
+
+def start_sidecar(name, spec):
+    """Private Docker daemon for one runner: own network, TLS client certs, shared workspace.
+
+    Jobs get no access to the host daemon (other runners, the coordinator and its PATs). The daemon
+    runs --privileged unless `dind_runtime` (e.g. sysbox-runc) can run it unprivileged."""
+    drop_sidecar(name)
+    labels = ["--label", f"{SIDECAR_LABEL}={name}", "--label", f"{COORD_LABEL}={COORD_ID}"]
+    docker("network", "create", *labels, f"{name}-net")
+    args = ["run", "-d", "--name", f"{name}-dind", *labels, "--network", f"{name}-net",
+            "--network-alias", "docker", "-e", "DOCKER_TLS_CERTDIR=/certs",
+            "-v", f"{name}-certs:/certs", "-v", f"{name}-work:{WORK_DIR}", *limits(spec)]
+    if spec.get("dind_runtime"):
+        args += ["--runtime", spec["dind_runtime"]]
+    else:
+        args += ["--privileged"]
+    dns = spec.get("dind_dns") or host_dns(spec["dind_image"])
+    docker(*args, spec["dind_image"], *(a for d in dns for a in ("--dns", d)))
+
+
 def forget(name):
     for s in (registered, warned):
         s.discard(name)
     started_at.pop(name, None)
 
 
-def remove(name):
+def remove(name, group=None):
     log(f"removing {name}")
     docker("stop", "-t", STOP_TIMEOUT, name, check=False)
     docker("rm", "-f", name, check=False)
+    drop_sidecar(name)
+    if group:
+        group.deregister(name)
     forget(name)
 
 
 def start(name, spec, group, pool=""):
     log(f"starting {name}")
     forget(name)
+    try:
+        token = group.registration_token()
+    except Fatal as e:
+        group.block(f"cannot get a registration token: {e}")
+        return False
+    except Exception as e:
+        log(f"{name}: cannot get a registration token (will retry): {e}")
+        next_try[name] = group.next_spawn = time.time() + 30
+        return False
     env = {**spec["env"], "RUNNER_NAME": name}
     # no docker restart policy: the coordinator restarts runners so it can tell crashes from startup failures
-    args = ["run", "-d", "--name", name,
+    args = ["create", "--name", name,
             "--label", f"{LABEL}=true", "--label", f"{HASH_LABEL}={spec_hash(spec)}",
-            "--label", f"{POOL_LABEL}={pool}", "--label", f"{COORD_LABEL}={COORD_ID}"]
+            "--label", f"{POOL_LABEL}={pool}", "--label", f"{COORD_LABEL}={COORD_ID}", *limits(spec)]
+    if spec["docker"] == "dind":
+        # in argv, not the subprocess env: there they would redirect the coordinator's own docker CLI
+        args += ["-e", "DOCKER_HOST=tcp://docker:2376", "-e", "DOCKER_TLS_VERIFY=1",
+                 "-e", "DOCKER_CERT_PATH=/certs/client"]
+        args += ["--network", f"{name}-net", "-v", f"{name}-certs:/certs:ro", "-v", f"{name}-work:{WORK_DIR}"]
+    elif spec["docker"] == "socket":
+        args += ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
     for k in env:
         args += ["-e", k]  # value passed via subprocess env, not argv
-    if spec["docker_socket"]:
-        args += ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
-    res = docker(*args, spec["image"], env=env, check=False)
-    if res.returncode:
-        reason = res.stderr.strip().replace("\n", " | ")
+    try:
+        if spec["docker"] == "dind":
+            start_sidecar(name, spec)
+        docker(*args, spec["image"], env=env)
+        docker("cp", "-", f"{name}:/home/runner/", data=token_tar(token))
+        docker("start", name)
+        res = None
+    except subprocess.CalledProcessError as e:
+        res = e
+    if res:
+        docker("rm", "-f", name, check=False)
+        drop_sidecar(name)
+        err = res.stderr.decode() if isinstance(res.stderr, bytes) else res.stderr
+        reason = err.strip().replace("\n", " | ")
         group.fails += 1
         log(f"failed to start {name} [{group.fails}/{MAX_FAILURES}]: {reason}")
         group.next_spawn = next_try[name] = time.time() + 10 * 2 ** group.fails
@@ -239,6 +369,7 @@ def handle_exit(name, info, group):
         if group.fails >= MAX_FAILURES:
             group.block(f"{MAX_FAILURES} runner startups failed in a row, last error: {reason}")
     docker("rm", "-f", name, check=False)
+    drop_sidecar(name)
     forget(name)
 
 
@@ -284,7 +415,7 @@ def scale_pool(slug, pool, alive):
                 break
     elif len(alive) > target:
         for name in [n for n in alive if n not in busy][: len(alive) - target]:
-            remove(name)
+            remove(name, group)
 
 
 def reconcile(fixed, pools):
@@ -292,7 +423,10 @@ def reconcile(fixed, pools):
     refreshed = {id(g): g.refresh() for g in groups.values()}
 
     alive = {slug: set() for slug in pools}
-    for name, info in existing().items():
+    have = existing()
+    for owner in sidecars().keys() - have.keys():  # runner gone (e.g. coordinator restarted mid-removal)
+        drop_sidecar(owner)
+    for name, info in have.items():
         pool = pools.get(info["pool"]) if info["pool"] else None
         if pool:
             spec, group = pool["base"], pool["group"]
@@ -302,7 +436,7 @@ def reconcile(fixed, pools):
             remove(name)  # no longer in config
             continue
         if info["hash"] != spec_hash(spec):
-            remove(name)
+            remove(name, group)
         elif info["state"] != "running":
             handle_exit(name, info, group)
         else:
@@ -320,8 +454,19 @@ def reconcile(fixed, pools):
 
 
 def down():
-    for name in existing():
-        remove(name)
+    try:
+        fixed, pools = parse(yaml.safe_load(CONFIG.read_bytes()))
+    except Exception as e:
+        log(f"cannot read {CONFIG}, removing runners without deregistering: {e}")
+        fixed, pools = {}, {}
+    for name, info in existing().items():
+        pool = pools.get(info["pool"])
+        group = pool["group"] if pool else fixed.get(name, (None, None))[1]
+        remove(name, group)
+    nets = docker("network", "ls", "--filter", f"label={SIDECAR_LABEL}", "--filter",
+                  f"label={COORD_LABEL}={COORD_ID}", "--format", '{{.Label "%s"}}' % SIDECAR_LABEL)
+    for owner in set(sidecars()) | set(nets.stdout.split()):
+        drop_sidecar(owner)
 
 
 def main():
