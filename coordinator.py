@@ -31,11 +31,13 @@ SCALE_INTERVAL = int(os.environ.get("SCALE_INTERVAL", "15"))  # GitHub API polli
 STOP_TIMEOUT = os.environ.get("STOP_TIMEOUT", "60")  # time for runner to deregister
 REGISTER_TIMEOUT = int(os.environ.get("REGISTER_TIMEOUT", "120"))  # warn if not online by then
 MAX_FAILURES = int(os.environ.get("MAX_FAILURES", "3"))  # startup failures before blocking
+PULL_INTERVAL = int(os.environ.get("IMAGE_PULL_INTERVAL", "3600"))  # 0 = never pull, use local images
 COORD_ID = os.environ.get("COORDINATOR_ID", "default")  # set a unique id per coordinator sharing one docker host
 LABEL = "selfhosted-runner.managed"
 COORD_LABEL = "selfhosted-runner.coordinator"
 HASH_LABEL = "selfhosted-runner.hash"
 POOL_LABEL = "selfhosted-runner.pool"
+IMAGE_LABEL = "selfhosted-runner.images"  # image IDs the runner (and its daemon) were started from
 SIDECAR_LABEL = "selfhosted-runner.sidecar"  # value: the runner the dind daemon belongs to
 DIND_IMAGE = "docker:29-dind"
 WORK_DIR = "/home/runner/actions-runner/_work"
@@ -195,7 +197,8 @@ def parse(cfg):
                 "dind_image": opts.get("dind_image", DIND_IMAGE),
                 "dind_runtime": opts.get("dind_runtime"),
                 "dind_dns": opts.get("dind_dns"),
-                "cpus": opts.get("cpus"), "memory": opts.get("memory")}
+                "cpus": opts.get("cpus"), "memory": opts.get("memory"),
+                "devices": list(opts.get("devices") or [])}
 
         if auto:
             if is_org and not opts.get("watch_repos"):
@@ -214,14 +217,87 @@ def parse(cfg):
 
 def existing():
     """name -> {hash, pool, state, status}"""
-    fmt = '{{.Names}}\t{{.State}}\t{{.Status}}\t{{.Label "%s"}}\t{{.Label "%s"}}' % (HASH_LABEL, POOL_LABEL)
+    fmt = '{{.Names}}\t{{.State}}\t{{.Status}}\t{{.Label "%s"}}\t{{.Label "%s"}}\t{{.Label "%s"}}' % (
+        HASH_LABEL, POOL_LABEL, IMAGE_LABEL)
     res = docker("ps", "-a", "--filter", f"label={LABEL}=true",
                  "--filter", f"label={COORD_LABEL}={COORD_ID}", "--format", fmt)
     out = {}
     for line in res.stdout.splitlines():
-        name, state, status, h, pool = line.split("\t")
-        out[name] = {"hash": h, "pool": pool, "state": state, "status": status}
+        name, state, status, h, pool, images = line.split("\t")
+        out[name] = {"hash": h, "pool": pool, "state": state, "status": status, "images": images}
     return out
+
+
+class Images:
+    """Pulls the configured images and pins each tag to an image ID.
+
+    Containers start from the pinned ID, so a pull never changes a runner mid-flight, and a runner image
+    is only adopted if it speaks this coordinator's PROTOCOL: a newer runner release than the coordinator
+    keeps the last compatible image instead of breaking every runner."""
+
+    def __init__(self):
+        self.pinned, self.last_pull, self.warned = {}, {}, set()
+
+    def image_id(self, ref):
+        res = docker("image", "inspect", "--format", "{{.Id}}\t{{with .Config.Labels}}{{index . \"%s\"}}{{end}}" % PROTOCOL_LABEL,
+                     ref, check=False)
+        if res.returncode:
+            return None, None
+        image_id, _, proto = res.stdout.rstrip("\n").partition("\t")
+        return image_id, proto
+
+    def refresh(self, ref, runner):
+        """Pull `ref` when due; return the pinned image ID (or the ref itself if nothing is local yet)."""
+        due = PULL_INTERVAL > 0 and time.time() - self.last_pull.get(ref, 0) >= PULL_INTERVAL
+        if due or ref not in self.pinned:
+            if due:
+                self.last_pull[ref] = time.time()
+                res = docker("pull", "-q", ref, check=False)
+                if res.returncode and ref not in self.warned:  # local-only tag, registry down...
+                    self.warned.add(ref)
+                    log(f"cannot pull {ref}, using the local image: {res.stderr.strip().splitlines()[-1:]}")
+            new, proto = self.image_id(ref)
+            old = self.pinned.get(ref)
+            if old and self.image_id(old)[0] is None:  # removed behind our back
+                del self.pinned[ref]
+                old = None
+            if new and new != old:
+                if runner and proto != PROTOCOL and old:
+                    if (ref, new) not in self.warned:
+                        self.warned.add((ref, new))
+                        log(f"{ref}: new image needs runner protocol {proto or 'none'}, this coordinator speaks "
+                            f"{PROTOCOL}; keeping {old[:19]}. Update the coordinator image.")
+                else:
+                    if old:
+                        log(f"{ref}: updated to {new[:19]}, replacing idle runners")
+                    self.pinned[ref] = new
+                    # own tag: an untagged image can be removed (pull moving the tag, image prune) while
+                    # runners still need to be restarted from it
+                    docker("tag", new, f"selfhosted-runner-pinned:{COORD_ID}-{hashlib.sha256(ref.encode()).hexdigest()[:12]}",
+                           check=False)
+        return self.pinned.get(ref, ref)
+
+    def resolve(self, spec):
+        """-> (runner image, dind image, label value naming both)"""
+        runner = self.refresh(spec["image"], True)
+        dind = self.refresh(spec["dind_image"], False) if spec["docker"] == "dind" else ""
+        return runner, dind, f"{runner}+{dind}"
+
+
+images = Images()
+
+
+def check_coordinator_image():
+    """Log when a newer image for this coordinator itself is available (it cannot replace itself safely)."""
+    me = docker("inspect", "--format", "{{.Config.Image}}\t{{.Image}}", os.environ.get("HOSTNAME", ""), check=False)
+    if me.returncode:
+        return
+    ref, _, current = me.stdout.rstrip("\n").partition("\t")
+    if docker("pull", "-q", ref, check=False).returncode == 0:
+        new, _ = images.image_id(ref)
+        if new and new != current and ("coordinator", new) not in images.warned:
+            images.warned.add(("coordinator", new))
+            log(f"newer coordinator image {ref} available: `docker compose pull && docker compose up -d`")
 
 
 def sidecars():
@@ -239,7 +315,8 @@ def drop_sidecar(name):
 
 
 def limits(spec):
-    args = []
+    """Resource limits and host devices, applied to the runner and its daemon alike."""
+    args = [a for d in spec.get("devices", []) for a in ("--device", d)]
     if spec.get("cpus"):
         args += ["--cpus", str(spec["cpus"])]
     if spec.get("memory"):
@@ -265,7 +342,7 @@ def host_dns(image):
     return _host_dns
 
 
-def start_sidecar(name, spec):
+def start_sidecar(name, spec, dind_image):
     """Private Docker daemon for one runner: own network, TLS client certs, shared workspace.
 
     Jobs get no access to the host daemon (other runners, the coordinator and its PATs). The daemon
@@ -281,7 +358,7 @@ def start_sidecar(name, spec):
     else:
         args += ["--privileged"]
     dns = spec.get("dind_dns") or host_dns(spec["dind_image"])
-    docker(*args, spec["dind_image"], *(a for d in dns for a in ("--dns", d)))
+    docker(*args, dind_image, *(a for d in dns for a in ("--dns", d)))
 
 
 def forget(name):
@@ -313,10 +390,12 @@ def start(name, spec, group, pool=""):
         next_try[name] = group.next_spawn = time.time() + 30
         return False
     env = {**spec["env"], "RUNNER_NAME": name}
+    runner_image, dind_image, image_label = images.resolve(spec)
     # no docker restart policy: the coordinator restarts runners so it can tell crashes from startup failures
     args = ["create", "--name", name,
             "--label", f"{LABEL}=true", "--label", f"{HASH_LABEL}={spec_hash(spec)}",
-            "--label", f"{POOL_LABEL}={pool}", "--label", f"{COORD_LABEL}={COORD_ID}", *limits(spec)]
+            "--label", f"{POOL_LABEL}={pool}", "--label", f"{COORD_LABEL}={COORD_ID}",
+            "--label", f"{IMAGE_LABEL}={image_label}", *limits(spec)]
     if spec["docker"] == "dind":
         # in argv, not the subprocess env: there they would redirect the coordinator's own docker CLI
         args += ["-e", "DOCKER_HOST=tcp://docker:2376", "-e", "DOCKER_TLS_VERIFY=1",
@@ -328,9 +407,9 @@ def start(name, spec, group, pool=""):
         args += ["-e", k]  # value passed via subprocess env, not argv
     try:
         if spec["docker"] == "dind":
-            start_sidecar(name, spec)
-        docker(*args, spec["image"], env=env)
-        proto = docker("inspect", "--format", '{{index .Config.Labels "%s"}}' % PROTOCOL_LABEL, name).stdout.strip()
+            start_sidecar(name, spec, dind_image)
+        docker(*args, runner_image, env=env)
+        proto = docker("inspect", "--format", '{{with .Config.Labels}}{{index . "%s"}}{{end}}' % PROTOCOL_LABEL, name).stdout.strip()
         if proto != PROTOCOL:
             docker("rm", "-f", name, check=False)
             drop_sidecar(name)
@@ -427,9 +506,19 @@ def scale_pool(slug, pool, alive):
             remove(name, group)
 
 
+def idle(name, group):
+    """Fresh check (not the cached list): replacing a runner that just took a job would kill the job."""
+    try:
+        runners = group.call(f"{group.scope}/actions/runners?per_page=100")["runners"]
+    except Exception:
+        return False
+    return any(r["name"] == name and not r["busy"] for r in runners)
+
+
 def reconcile(fixed, pools):
     groups = {id(g): g for _, g in fixed.values()} | {id(p["group"]): p["group"] for p in pools.values()}
     refreshed = {id(g): g.refresh() for g in groups.values()}
+    current = {}  # spec hash -> image label runners should carry
 
     alive = {slug: set() for slug in pools}
     have = existing()
@@ -448,6 +537,10 @@ def reconcile(fixed, pools):
             remove(name, group)
         elif info["state"] != "running":
             handle_exit(name, info, group)
+        elif (info["images"] != current.setdefault(info["hash"], images.resolve(spec)[2])
+              and name in registered and name not in group.busy and idle(name, group)):
+            remove(name, group)  # image updated; restarted below from the new one
+            continue
         else:
             check_registration(name, group)
             if pool:
@@ -484,9 +577,13 @@ def main():
         return
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # leave runners running
     fixed, pools, last = {}, {}, None
+    coord_checked = 0.0
     while True:
         raw = None
         try:
+            if PULL_INTERVAL > 0 and time.time() - coord_checked >= PULL_INTERVAL:
+                coord_checked = time.time()
+                check_coordinator_image()
             raw = CONFIG.read_bytes()
             if raw != last:
                 log(f"loading {CONFIG}")

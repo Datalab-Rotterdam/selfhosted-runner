@@ -56,6 +56,9 @@ fi
 # docker: dind gives the runner a workspace volume shared with its daemon (so `docker run -v
 # $GITHUB_WORKSPACE:...` resolves) and client certs that appear once the daemon has started.
 sudo chown runner:runner _work
+# `devices: [/dev/kvm]`: the node keeps the host's group, which the runner user is not in. This changes
+# only the container's own copy of the node.
+[[ -c /dev/kvm ]] && sudo chmod 0666 /dev/kvm
 if [[ -n "${DOCKER_CERT_PATH:-}" ]]; then
   for _ in $(seq 60); do [[ -s "${DOCKER_CERT_PATH}/ca.pem" ]] && break; sleep 1; done
   [[ -s "${DOCKER_CERT_PATH}/ca.pem" ]] || echo "WARN: no docker client certs in ${DOCKER_CERT_PATH}" >&2
