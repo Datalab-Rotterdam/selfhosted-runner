@@ -49,4 +49,7 @@ RUN case "${TARGETARCH:-amd64}" in \
 COPY --chown=runner:runner entrypoint.sh /home/runner/entrypoint.sh
 RUN chmod +x /home/runner/entrypoint.sh
 
+# Coordinator/runner contract: 2 = registration token arrives as a file, no PAT in the container.
+LABEL selfhosted-runner.protocol="2"
+
 ENTRYPOINT ["/usr/bin/tini", "--", "/home/runner/entrypoint.sh"]

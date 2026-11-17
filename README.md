@@ -73,6 +73,10 @@ or it restarts the runners that `--down` removes.)
 
 If the GHCR packages are private, `docker login ghcr.io` first or make them public.
 
+Run the coordinator and runner images from the same release. A coordinator newer than its runner image
+blocks the entry with `runner image ... is older than this coordinator` instead of starting runners that
+cannot register.
+
 ## Examples
 
 | folder | shows |

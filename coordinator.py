@@ -41,6 +41,8 @@ DIND_IMAGE = "docker:29-dind"
 WORK_DIR = "/home/runner/actions-runner/_work"
 TOKEN_FILE = ".registration-token"  # in /home/runner; entrypoint.sh deletes it after registering
 RUNNER_UID = 1001
+PROTOCOL_LABEL = "selfhosted-runner.protocol"
+PROTOCOL = "2"  # runner image reads its registration token from TOKEN_FILE
 
 HINTS = {
     401: "PAT rejected (invalid or expired)",
@@ -328,6 +330,13 @@ def start(name, spec, group, pool=""):
         if spec["docker"] == "dind":
             start_sidecar(name, spec)
         docker(*args, spec["image"], env=env)
+        proto = docker("inspect", "--format", '{{index .Config.Labels "%s"}}' % PROTOCOL_LABEL, name).stdout.strip()
+        if proto != PROTOCOL:
+            docker("rm", "-f", name, check=False)
+            drop_sidecar(name)
+            group.block(f"runner image {spec['image']} is older than this coordinator (protocol {proto or 'none'}, "
+                        f"need {PROTOCOL}): use the same release for both images, or `make build` for a local one")
+            return False
         docker("cp", "-", f"{name}:/home/runner/", data=token_tar(token))
         docker("start", name)
         res = None
