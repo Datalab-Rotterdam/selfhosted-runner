@@ -73,6 +73,10 @@ or it restarts the runners that `--down` removes.)
 
 If the GHCR packages are private, `docker login ghcr.io` first or make them public.
 
+Run the coordinator and runner images from the same release. A coordinator newer than its runner image
+blocks the entry with `runner image ... is older than this coordinator` instead of starting runners that
+cannot register.
+
 ## Examples
 
 | folder | shows |
@@ -101,10 +105,11 @@ If the GHCR packages are private, `docker login ghcr.io` first or make them publ
 | `dind_runtime` | repo/defaults | container runtime for the daemon, e.g. `sysbox-runc`; without it the daemon runs `--privileged` |
 | `dind_dns` | repo/defaults | DNS servers for containers inside the daemon (default: the servers the host gives containers) |
 | `cpus`, `memory` | repo/defaults | `docker run --cpus/--memory` for the runner and, with `dind`, its daemon |
+| `devices` | repo/defaults | host devices for the runner and, with `dind`, its daemon, e.g. `[/dev/kvm]` (see [KVM](#kvm)) |
 | `docker_socket` | repo/defaults | old spelling of `docker: socket` |
 | `api_url` | repo/defaults | GitHub Enterprise API base URL |
 
-Coordinator env vars: `POLL_INTERVAL` (default 5s), `SCALE_INTERVAL` (GitHub API poll for autoscale, default 15s),
+Coordinator env vars: `IMAGE_PULL_INTERVAL` (default 3600s, see [Image updates](#image-updates)), `POLL_INTERVAL` (default 5s), `SCALE_INTERVAL` (GitHub API poll for autoscale, default 15s),
 `COORDINATOR_ID` (default `default`; set a unique value per coordinator if several share one Docker host, otherwise they remove each other's runners and runner names must also differ via `name_prefix`), `STOP_TIMEOUT` (time for a runner to deregister on stop, default 60s), `REGISTER_TIMEOUT` (warn if a runner isn't online by then, default 120s), `MAX_FAILURES` (startup failures before a repo is blocked, default 3).
 
 ## Health checks and logs
@@ -138,7 +143,9 @@ with that list; raise `SCALE_INTERVAL` if you watch many.
 
 ## Docker in jobs
 
-The runner image ships the Docker CLI (with buildx and compose) but no daemon. With `docker: dind`
+The runner image ships the Docker CLI (with buildx and compose) but no daemon, plus the build basics GitHub-hosted
+images have and workflows assume: `build-essential` (cgo), `pkg-config`, `python3`, `xz-utils` (`actions/setup-*`
+archives), `zstd` and `file`. With `docker: dind`
 the coordinator starts, next to each runner:
 
 - a `docker:dind` daemon (`<runner>-dind`) on a network of its own (`<runner>-net`), reachable from the
@@ -166,6 +173,32 @@ What this isolates, and what it does not:
   container onto the Docker host. Treat the host as belonging to the repos it serves, and only attach
   private repos you trust. For a hard boundary install [Sysbox](https://github.com/nestybox/sysbox) and
   set `dind_runtime: sysbox-runc`, or run the coordinator inside a dedicated VM.
+
+## KVM
+
+For jobs that boot VMs with QEMU/KVM, give the runners the host's `/dev/kvm`:
+
+```yaml
+defaults:
+  devices: [/dev/kvm]
+```
+
+The runner user can use it directly, and with `docker: dind` so can containers that jobs start with
+`--device /dev/kvm` or `--privileged`. The host needs hardware virtualization: on a VM (Proxmox,
+Hyper-V, ...) turn on nested virtualization for it (Proxmox: CPU type `host`), and check that
+`/dev/kvm` exists on the Docker host. A missing device makes runner startup fail and blocks the entry.
+
+## Image updates
+
+The coordinator pulls `image` and `dind_image` at startup and every `IMAGE_PULL_INTERVAL` seconds
+(default 3600, `0` = never pull). When a tag points at a new image, idle runners are replaced; busy runners
+finish their job first. Tags that only exist locally (`make build`) are used as they are.
+
+A runner image is only adopted if it matches the coordinator's runner protocol; a newer, incompatible
+runner release is skipped (logged) until the coordinator is updated. The coordinator can't replace its own
+container: it logs when a newer coordinator image is available, update it with
+`docker compose pull && docker compose up -d`. Pin both images to a major tag (`:1`) to take fixes and
+features automatically but not breaking changes.
 
 ## Building locally
 
