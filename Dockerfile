@@ -11,6 +11,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl git gnupg jq sudo tini unzip \
+        # what GitHub-hosted images have and jobs assume: cgo, setup-* tool archives (.tar.xz), zstd
+        build-essential file pkg-config python3 xz-utils zstd \
     && rm -rf /var/lib/apt/lists/*
 
 # Docker client only (no daemon): with `docker: dind` jobs reach a per-runner daemon over TLS.

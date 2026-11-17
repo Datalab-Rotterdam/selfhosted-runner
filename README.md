@@ -143,7 +143,9 @@ with that list; raise `SCALE_INTERVAL` if you watch many.
 
 ## Docker in jobs
 
-The runner image ships the Docker CLI (with buildx and compose) but no daemon. With `docker: dind`
+The runner image ships the Docker CLI (with buildx and compose) but no daemon, plus the build basics GitHub-hosted
+images have and workflows assume: `build-essential` (cgo), `pkg-config`, `python3`, `xz-utils` (`actions/setup-*`
+archives), `zstd` and `file`. With `docker: dind`
 the coordinator starts, next to each runner:
 
 - a `docker:dind` daemon (`<runner>-dind`) on a network of its own (`<runner>-net`), reachable from the
